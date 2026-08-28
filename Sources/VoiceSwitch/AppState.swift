@@ -305,7 +305,8 @@ final class AppState: ObservableObject {
             self.isTranscribing = false
 
             switch result {
-            case .success(let transcription):
+            case .success(let rawTranscription):
+                let transcription = rawTranscription.applyingReplacements()
                 self.lastResult = transcription
                 self.lastRating = nil
                 self.lastMetrics = self.asrMetrics(for: transcription)

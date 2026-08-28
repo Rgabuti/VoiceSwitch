@@ -35,6 +35,37 @@ final class FrontmostApplicationTracker {
 
 enum TextInjector {
     private static let focusRestoreDelay: TimeInterval = 0.35
+    private static let pasteboardRestoreDelay: TimeInterval = 0.4
+
+    /// Снимок буфера обмена: сохраняет все элементы со всеми типами,
+    /// чтобы вернуть на место не только текст, но и картинки или файлы.
+    private struct PasteboardSnapshot {
+        private let items: [[NSPasteboard.PasteboardType: Data]]
+
+        static func capture() -> PasteboardSnapshot {
+            let items = (NSPasteboard.general.pasteboardItems ?? []).map { item in
+                item.types.reduce(into: [NSPasteboard.PasteboardType: Data]()) { stored, type in
+                    stored[type] = item.data(forType: type)
+                }
+            }
+            return PasteboardSnapshot(items: items)
+        }
+
+        func restore() {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard !items.isEmpty else { return }
+            pasteboard.writeObjects(
+                items.map { stored in
+                    let item = NSPasteboardItem()
+                    for (type, data) in stored {
+                        item.setData(data, forType: type)
+                    }
+                    return item
+                }
+            )
+        }
+    }
 
     private struct AccessibilityAttempt {
         let succeeded: Bool
@@ -63,8 +94,8 @@ enum TextInjector {
             errorCode: 0
         )
 
-        copy(text)
         guard accessibilityAuthorized else {
+            copy(text)
             return false
         }
 
@@ -111,7 +142,8 @@ enum TextInjector {
                 let method = frontmostPID == validTargetPID
                     ? "keyboard_global"
                     : "keyboard_target_pid"
-                postPasteShortcut(
+                pasteViaPasteboard(
+                    text,
                     to: frontmostPID == validTargetPID ? nil : validTargetPID
                 )
                 ComparisonLogger.appendInjection(
@@ -126,7 +158,7 @@ enum TextInjector {
                 return
             }
 
-            postPasteShortcut(to: nil)
+            pasteViaPasteboard(text, to: nil)
             ComparisonLogger.appendInjection(
                 targetPID: nil,
                 targetName: "unknown",
@@ -209,6 +241,17 @@ enum TextInjector {
                 ? -1
                 : insertionResult.rawValue
         )
+    }
+
+    /// Запасной путь: поле не приняло прямую вставку, поэтому текст идёт через
+    /// буфер обмена и ⌘V. Прежнее содержимое буфера возвращается на место.
+    private static func pasteViaPasteboard(_ text: String, to targetPID: pid_t?) {
+        let snapshot = PasteboardSnapshot.capture()
+        copy(text)
+        postPasteShortcut(to: targetPID)
+        DispatchQueue.main.asyncAfter(deadline: .now() + pasteboardRestoreDelay) {
+            snapshot.restore()
+        }
     }
 
     private static func postPasteShortcut(to targetPID: pid_t?) {

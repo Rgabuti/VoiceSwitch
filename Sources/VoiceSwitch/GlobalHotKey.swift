@@ -7,6 +7,7 @@ final class GlobalHotKey {
     private var isPressed = false
 
     var onPress: (() -> Void)?
+    var onRelease: (() -> Void)?
     func start() {
         stop()
 
@@ -35,9 +36,13 @@ final class GlobalHotKey {
     private func handle(_ event: NSEvent) {
         guard event.type == .flagsChanged else { return }
 
+        // Push-to-talk: запись идёт, пока удерживается одиночный fn.
+        // Событие flagsChanged приходит только от самой клавиши-модификатора,
+        // поэтому стрелки и F-клавиши, несущие флаг .function в keyDown,
+        // сюда не попадают.
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let chordIsPressed = modifiers.contains(.function)
-            && modifiers.contains(.option)
+            && !modifiers.contains(.option)
             && !modifiers.contains(.command)
             && !modifiers.contains(.control)
             && !modifiers.contains(.shift)
@@ -45,9 +50,11 @@ final class GlobalHotKey {
         guard chordIsPressed != isPressed else { return }
         isPressed = chordIsPressed
 
-        if chordIsPressed {
-            DispatchQueue.main.async { [weak self] in
+        DispatchQueue.main.async { [weak self] in
+            if chordIsPressed {
                 self?.onPress?()
+            } else {
+                self?.onRelease?()
             }
         }
     }

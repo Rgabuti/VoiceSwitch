@@ -106,6 +106,15 @@ final class AppState: ObservableObject {
         let hudModel = HUDModel()
         self.hudModel = hudModel
 
+        // Весь интерфейс живёт в попапе строки меню, и если иконку там не найти,
+        // выдать универсальный доступ неоткуда. Поэтому при запуске без доверия
+        // просим системный диалог — он ведёт прямо в нужный список настроек.
+        if !Permissions.accessibilityAuthorized {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                Permissions.showAccessibilityRequest()
+            }
+        }
+
         if ProcessInfo.processInfo.environment["VOICESWITCH_FORCE_ONBOARDING"] == "1" {
             onboardingCompleted = false
         } else if UserDefaults.standard.object(forKey: "onboardingCompleted") == nil {
@@ -120,7 +129,10 @@ final class AppState: ObservableObject {
         }
 
         hotKey.onPress = { [weak self] in
-            self?.toggleRecording(source: "hotkey")
+            self?.startRecording(source: "hotkey")
+        }
+        hotKey.onRelease = { [weak self] in
+            self?.stopRecording()
         }
         hotKey.start()
 

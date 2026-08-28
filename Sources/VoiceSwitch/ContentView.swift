@@ -191,7 +191,7 @@ struct ContentView: View {
                 .font(.title3.weight(.semibold))
                 .foregroundStyle(.green)
 
-            Text("Установлено: \(installedComponentNames). Нажмите fn + Option, скажите фразу и нажмите сочетание ещё раз.")
+            Text("Установлено: \(installedComponentNames). Удерживайте fn и говорите — запись остановится, когда отпустите клавишу.")
                 .font(.callout)
 
             if !state.accessibilityAuthorized {

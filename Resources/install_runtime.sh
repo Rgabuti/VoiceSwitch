@@ -17,8 +17,13 @@ LOG_FILE="${RUNTIME_ROOT}/install.log"
 COMPONENT_MARKERS_ROOT="${RUNTIME_ROOT}/components"
 
 UV_VERSION="0.11.32"
-GIGAAM_COMMIT="559d88d6b72541412743929f633a6ae7c9950b85"
-GIGAAM_ARCHIVE="https://github.com/salute-developers/GigaAM/archive/${GIGAAM_COMMIT}.zip"
+TRANSCRIBE_CPP_VERSION="0.2.3"
+TRANSCRIBE_NATIVE_URL="https://github.com/handy-computer/transcribe.cpp/releases/download/v${TRANSCRIBE_CPP_VERSION}/transcribe-native-${TRANSCRIBE_CPP_VERSION}-macos-arm64-metal.tar.gz"
+TRANSCRIBE_NATIVE_SHA256="1cc5e89d442f55c165a3f90e49090cec75cec349071d834c0aa656161afa9543"
+NATIVE_ROOT="${RUNTIME_ROOT}/native"
+GIGAAM_GGUF_NAME="gigaam-v3-e2e-rnnt-Q8_0.gguf"
+GIGAAM_GGUF_URL="https://huggingface.co/handy-computer/gigaam-v3-e2e-rnnt-gguf/resolve/main/${GIGAAM_GGUF_NAME}"
+GIGAAM_GGUF_SHA256="78d63b47723b7f8d78c6113a6ef983b5a86e2a86f6c273e1f5cb6967b1c4467a"
 
 STATUS_MARKER="__VOICESWITCH_SETUP__"
 ERROR_MARKER="__VOICESWITCH_SETUP_ERROR__"
@@ -47,7 +52,7 @@ write_install_marker() {
     print -r -- "runtime_version=4"
     print -r -- "selective_install=1"
     print -r -- "uv_version=${UV_VERSION}"
-    print -r -- "gigaam_commit=${GIGAAM_COMMIT}"
+    print -r -- "transcribe_cpp=${TRANSCRIBE_CPP_VERSION}"
     local marker
     for marker in "${COMPONENT_MARKERS_ROOT}"/*.ready(N); do
       print -r -- "component=${marker:t:r}"
@@ -99,6 +104,14 @@ run_with_retries() {
   done
 
   return "${exit_code}"
+}
+
+verify_sha256() {
+  local file=$1
+  local expected=$2
+  local actual
+  actual=$(shasum -a 256 "${file}" | cut -d ' ' -f 1)
+  [[ "${actual}" == "${expected}" ]]
 }
 
 download_with_resume() {
@@ -187,7 +200,6 @@ export HF_HOME="${MODEL_ROOT}/huggingface"
 export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
 export HF_HUB_DOWNLOAD_TIMEOUT=120
 export HF_HUB_ETAG_TIMEOUT=30
-export TORCH_HOME="${MODEL_ROOT}/torch"
 export TOKENIZERS_PARALLELISM=false
 export PATH="${BIN_ROOT}:/usr/bin:/bin:/usr/sbin:/sbin"
 
@@ -245,27 +257,61 @@ ln -sf "${FFMPEG_EXECUTABLE}" "${BIN_ROOT}/ffmpeg" || \
   fail_step "Настраиваю ffmpeg"
 
 if component_requested gigaam; then
-  run_with_retries \
-    "Устанавливаю движок GigaAM…" \
-    3 \
-    "${UV_EXECUTABLE}" pip install \
-      --python "${PYTHON}" \
-      torchaudio \
-      "${GIGAAM_ARCHIVE}" || fail_step "Устанавливаю движок GigaAM"
+  mkdir -p "${NATIVE_ROOT}" "${MODEL_ROOT}/gigaam"
 
-  status "Проверяю зависимости GigaAM…"
-  if ! "${PYTHON}" -c 'import torch, torchaudio, gigaam'; then
-    fail \
-      "Не удалось загрузить зависимости GigaAM (torch/torchaudio). Нажмите «Продолжить установку», чтобы восстановить окружение. Журнал: ${LOG_FILE}"
+  if [[ ! -f "${NATIVE_ROOT}/libtranscribe.dylib" ]] || \
+     [[ "$(cat "${NATIVE_ROOT}/version.txt" 2>/dev/null)" != "${TRANSCRIBE_CPP_VERSION}" ]]; then
+    NATIVE_ARCHIVE="${TOOLS_ROOT}/transcribe-native-${TRANSCRIBE_CPP_VERSION}.tar.gz"
+    if [[ -f "${NATIVE_ARCHIVE}" ]] && ! verify_sha256 "${NATIVE_ARCHIVE}" "${TRANSCRIBE_NATIVE_SHA256}"; then
+      rm -f "${NATIVE_ARCHIVE}"
+    fi
+    if [[ ! -f "${NATIVE_ARCHIVE}" ]]; then
+      download_with_resume \
+        "${TRANSCRIBE_NATIVE_URL}" \
+        "${NATIVE_ARCHIVE}" \
+        "Загружаю библиотеку transcribe.cpp…"
+    fi
+    verify_sha256 "${NATIVE_ARCHIVE}" "${TRANSCRIBE_NATIVE_SHA256}" || {
+      rm -f "${NATIVE_ARCHIVE}"
+      fail "Архив transcribe.cpp повреждён при загрузке. Нажмите «Продолжить установку»."
+    }
+    status "Распаковываю transcribe.cpp…"
+    tar -xzf "${NATIVE_ARCHIVE}" -C "${NATIVE_ROOT}" --strip-components 1 || \
+      fail_step "Распаковываю transcribe.cpp"
+    print -r -- "${TRANSCRIBE_CPP_VERSION}" > "${NATIVE_ROOT}/version.txt"
   fi
 
   run_with_retries \
-    "Загружаю GigaAM v3 E2E RNNT…" \
+    "Устанавливаю биндинг transcribe.cpp…" \
     3 \
-    "${PYTHON}" "${ASR_WORKER}" \
-      --download \
-      --engine gigaam \
-      --cache "${MODEL_ROOT}" || fail_step "Загружаю GigaAM v3 E2E RNNT"
+    "${UV_EXECUTABLE}" pip install \
+      --python "${PYTHON}" \
+      "transcribe-cpp==${TRANSCRIBE_CPP_VERSION}" || fail_step "Устанавливаю биндинг transcribe.cpp"
+
+  GIGAAM_GGUF="${MODEL_ROOT}/gigaam/${GIGAAM_GGUF_NAME}"
+  if [[ -f "${GIGAAM_GGUF}" ]] && ! verify_sha256 "${GIGAAM_GGUF}" "${GIGAAM_GGUF_SHA256}"; then
+    rm -f "${GIGAAM_GGUF}"
+  fi
+  if [[ ! -f "${GIGAAM_GGUF}" ]]; then
+    download_with_resume \
+      "${GIGAAM_GGUF_URL}" \
+      "${GIGAAM_GGUF}" \
+      "Загружаю GigaAM v3 E2E RNNT (261 МБ)…"
+    status "Проверяю контрольную сумму модели…"
+    verify_sha256 "${GIGAAM_GGUF}" "${GIGAAM_GGUF_SHA256}" || {
+      rm -f "${GIGAAM_GGUF}"
+      fail "Модель GigaAM повреждена при загрузке. Нажмите «Продолжить установку»."
+    }
+  fi
+
+  run_with_retries \
+    "Проверяю движок GigaAM…" \
+    2 \
+    /usr/bin/env "TRANSCRIBE_LIBRARY=${NATIVE_ROOT}/libtranscribe.dylib" \
+      "${PYTHON}" "${ASR_WORKER}" \
+        --download \
+        --engine gigaam \
+        --cache "${MODEL_ROOT}" || fail_step "Проверяю движок GigaAM"
   mark_component gigaam
 fi
 

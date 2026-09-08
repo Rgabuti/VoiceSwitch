@@ -77,6 +77,8 @@ class WorkerSmokeTest(unittest.TestCase):
             text=True, env=env,
         )
         self.addCleanup(process.kill)
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stdin.close)
 
         ready = self.read_until(process, "ready")
         self.assertEqual(ready["engine"], "gigaam")

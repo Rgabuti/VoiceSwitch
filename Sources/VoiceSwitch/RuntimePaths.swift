@@ -117,8 +117,36 @@ enum RuntimePaths {
         return Set(RuntimeComponent.allCases)
     }
 
+    static let gigaamModelFileName = "gigaam-v3-e2e-rnnt-Q8_0.gguf"
+
+    static var nativeRoot: URL {
+        runtimeRoot.appendingPathComponent("native", isDirectory: true)
+    }
+
+    static var transcribeLibrary: URL {
+        nativeRoot.appendingPathComponent("libtranscribe.dylib")
+    }
+
+    static var gigaamModel: URL {
+        modelCache
+            .appendingPathComponent("gigaam", isDirectory: true)
+            .appendingPathComponent(gigaamModelFileName)
+    }
+
+    /// GigaAM считается установленным, только если на месте и библиотека
+    /// transcribe.cpp, и GGUF: после обновления со старого torch-рантайма
+    /// маркер есть, а файлов нет — приложение должно предложить доустановку.
+    static var gigaamFilesPresent: Bool {
+        FileManager.default.fileExists(atPath: transcribeLibrary.path)
+            && FileManager.default.fileExists(atPath: gigaamModel.path)
+    }
+
     static func isInstalled(_ component: RuntimeComponent) -> Bool {
-        installedComponents.contains(component)
+        guard installedComponents.contains(component) else { return false }
+        if component == .gigaam {
+            return gigaamFilesPresent
+        }
+        return true
     }
 
     static var installMarker: URL {

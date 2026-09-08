@@ -37,7 +37,7 @@ enum RuntimeComponent: String, CaseIterable, Identifiable, Codable, Hashable {
     var downloadSize: String {
         switch self {
         case .gigaam:
-            return "≈ 0,5 ГБ + базовое окружение"
+            return "≈ 0,3 ГБ + базовое окружение"
         case .whisper:
             return "≈ 1,5 ГБ"
         case .qwenASR:

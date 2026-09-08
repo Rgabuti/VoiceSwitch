@@ -167,6 +167,7 @@ final class ASRService {
             .appendingPathComponent("huggingface", isDirectory: true).path
         environment["TOKENIZERS_PARALLELISM"] = "false"
         environment["PYTHONPATH"] = RuntimePaths.pythonPackages.path
+        environment["TRANSCRIBE_LIBRARY"] = RuntimePaths.transcribeLibrary.path
         newProcess.environment = environment
 
         newOutput.fileHandleForReading.readabilityHandler = { [weak self] handle in

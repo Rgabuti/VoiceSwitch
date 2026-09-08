@@ -117,9 +117,15 @@ enum TextInjector {
 
         let targetApplication = validTargetPID.flatMap(NSRunningApplication.init(processIdentifier:))
         let targetName = targetApplication?.localizedName ?? "unknown"
-        targetApplication?.activate(options: [])
+        // Если целевое окно уже впереди (обычный случай: диктовка в активное
+        // поле), активировать нечего и ждать восстановления фокуса не нужно.
+        let needsActivation = currentPID == nil
+        if needsActivation {
+            targetApplication?.activate(options: [])
+        }
+        let delay = needsActivation ? focusRestoreDelay : 0
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + focusRestoreDelay) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             let frontmostPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
             if let validTargetPID {
                 let attempt = insertIntoFocusedElement(

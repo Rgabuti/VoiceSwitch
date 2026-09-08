@@ -12,7 +12,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 import time
 import traceback
 import wave
@@ -21,8 +20,10 @@ from typing import Any
 
 PROTOCOL_PREFIX = "__VOICESWITCH_JSON__"
 WHISPER_MODEL = "mlx-community/whisper-large-v3-turbo"
-GIGAAM_MODEL = "v3_e2e_rnnt"
+GIGAAM_GGUF = "gigaam-v3-e2e-rnnt-Q8_0.gguf"
+GIGAAM_MAX_SECONDS = 22.0
 QWEN_MODEL = "Qwen/Qwen3-ASR-1.7B"
+INSTALL_HINT = "Запустите установку моделей из меню VoiceSwitch."
 
 
 def emit(message_type: str, **payload: Any) -> None:
@@ -47,6 +48,21 @@ def configure_environment(cache_root: Path) -> None:
 def wav_duration(path: Path) -> float:
     with wave.open(str(path), "rb") as wav_file:
         return wav_file.getnframes() / float(wav_file.getframerate())
+
+
+def read_wav_pcm(path: Path) -> tuple["np.ndarray", int]:
+    """Читает mono 16-bit WAV в float32 [-1, 1] без ffmpeg."""
+    import numpy as np
+
+    with wave.open(str(path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        rate = wav_file.getframerate()
+        frames = wav_file.readframes(wav_file.getnframes())
+    if channels != 1 or sample_width != 2:
+        raise ValueError("Ожидается mono PCM WAV 16-bit.")
+    samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    return samples, rate
 
 
 def split_pcm(
@@ -97,38 +113,77 @@ def split_pcm(
     return [samples[left:right] for left, right in zip(boundaries, boundaries[1:])]
 
 
-def split_wav_for_gigaam(
-    source: Path,
-    *,
-    maximum_seconds: float = 22.0,
-) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
-    """Split on a low-energy region so every GigaAM chunk stays below 25 s."""
-    import numpy as np
+class TranscribeCppGigaAM:
+    """GigaAM v3 e2e RNNT в GGUF через transcribe.cpp (Metal, откат на CPU)."""
 
-    with wave.open(str(source), "rb") as wav_file:
-        parameters = wav_file.getparams()
-        frame_rate = wav_file.getframerate()
-        channels = wav_file.getnchannels()
-        sample_width = wav_file.getsampwidth()
-        frames = wav_file.readframes(wav_file.getnframes())
+    def __init__(self, cache_root: Path):
+        self.cache_root = cache_root
+        self.model: Any = None
+        self.session: Any = None
+        self.backend = ""
 
-    if channels != 1 or sample_width != 2:
-        raise ValueError("Ожидается mono PCM WAV 16-bit.")
+    @staticmethod
+    def library_path(cache_root: Path) -> Path:
+        override = os.environ.get("TRANSCRIBE_LIBRARY")
+        if override:
+            return Path(override)
+        return cache_root.parent / "native" / "libtranscribe.dylib"
 
-    samples = np.frombuffer(frames, dtype="<i2")
-    chunks = split_pcm(samples, frame_rate, maximum_seconds=maximum_seconds)
-    if len(chunks) == 1:
-        return [source], None
+    def model_path(self) -> Path:
+        return self.cache_root / "gigaam" / GIGAAM_GGUF
 
-    temporary = tempfile.TemporaryDirectory(prefix="voiceswitch-gigaam-")
-    outputs: list[Path] = []
-    for index, chunk in enumerate(chunks):
-        output = Path(temporary.name) / f"chunk-{index:03d}.wav"
-        with wave.open(str(output), "wb") as wav_file:
-            wav_file.setparams(parameters)
-            wav_file.writeframes(chunk.astype("<i2").tobytes())
-        outputs.append(output)
-    return outputs, temporary
+    def load(self) -> None:
+        import numpy as np
+
+        library = self.library_path(self.cache_root)
+        if not library.is_file():
+            raise RuntimeError(
+                f"Не найдена библиотека transcribe.cpp: {library}. {INSTALL_HINT}"
+            )
+        model_file = self.model_path()
+        if not model_file.is_file():
+            raise RuntimeError(
+                f"Не найдена модель GigaAM (GGUF): {model_file}. {INSTALL_HINT}"
+            )
+        os.environ["TRANSCRIBE_LIBRARY"] = str(library)
+
+        import transcribe_cpp
+
+        devices = list(transcribe_cpp.backends())
+        gpu = next((d for d in devices if d.device_type == "gpu"), None)
+        cpu = next((d for d in devices if d.device_type == "cpu"), None)
+        model = None
+        if gpu is not None:
+            try:
+                model = transcribe_cpp.Model(str(model_file), device=gpu)
+                self.backend = gpu.kind
+            except transcribe_cpp.TranscribeError as error:
+                print(
+                    f"GigaAM: GPU недоступен ({error}), перехожу на CPU.",
+                    file=sys.stderr,
+                )
+        if model is None:
+            if cpu is None:
+                raise RuntimeError(
+                    "transcribe.cpp не нашёл ни одного вычислительного устройства."
+                )
+            model = transcribe_cpp.Model(str(model_file), device=cpu)
+            self.backend = "cpu"
+        self.model = model
+        self.session = model.session()
+        # Прогрев: первый вызов на Metal компилирует пайплайны (~0,3 с).
+        self.session.run(np.zeros(16000, dtype=np.float32))
+
+    def transcribe(self, audio: Path) -> str:
+        samples, rate = read_wav_pcm(audio)
+        if rate != 16000:
+            raise ValueError(f"Ожидается WAV 16 кГц, получено {rate} Гц.")
+        texts: list[str] = []
+        for chunk in split_pcm(samples, rate, maximum_seconds=GIGAAM_MAX_SECONDS):
+            text = self.session.run(chunk).text.strip()
+            if text:
+                texts.append(text)
+        return " ".join(texts).strip()
 
 
 class Recognizer:
@@ -136,6 +191,10 @@ class Recognizer:
         self.engine = engine
         self.cache_root = cache_root
         self.model: Any = None
+
+    @property
+    def backend(self) -> str:
+        return getattr(self.model, "backend", "")
 
     def load(self) -> None:
         if self.engine == "whisper":
@@ -145,15 +204,13 @@ class Recognizer:
 
             self.model = ModelHolder.get_model(WHISPER_MODEL, mx.float16)
         elif self.engine == "gigaam":
-            emit("loading", engine=self.engine, message="Загрузка GigaAM v3 E2E RNNT…")
-            import gigaam
-
-            self.model = gigaam.load_model(
-                GIGAAM_MODEL,
-                device="cpu",
-                fp16_encoder=False,
-                download_root=str(self.cache_root / "gigaam"),
+            emit(
+                "loading",
+                engine=self.engine,
+                message="Загрузка GigaAM v3 E2E RNNT (transcribe.cpp)…",
             )
+            self.model = TranscribeCppGigaAM(self.cache_root)
+            self.model.load()
         elif self.engine == "qwen":
             emit("loading", engine=self.engine, message="Загрузка Qwen3-ASR 1.7B…")
             from mlx_qwen3_asr import Session
@@ -167,7 +224,7 @@ class Recognizer:
             return self._transcribe_whisper(audio, prompt)
         if self.engine == "qwen":
             return self._transcribe_qwen(audio, prompt)
-        return self._transcribe_gigaam(audio), "ru"
+        return self.model.transcribe(audio), "ru"
 
     def _transcribe_whisper(
         self,
@@ -190,20 +247,6 @@ class Recognizer:
             hallucination_silence_threshold=1.5,
         )
         return result.get("text", "").strip(), result.get("language")
-
-    def _transcribe_gigaam(self, audio: Path) -> str:
-        chunks, temporary = split_wav_for_gigaam(audio)
-        try:
-            texts: list[str] = []
-            for chunk in chunks:
-                result = self.model.transcribe(str(chunk))
-                text = getattr(result, "text", str(result)).strip()
-                if text:
-                    texts.append(text)
-            return " ".join(texts).strip()
-        finally:
-            if temporary is not None:
-                temporary.cleanup()
 
     def _transcribe_qwen(
         self,
@@ -232,7 +275,7 @@ def serve(engine: str, cache_root: Path) -> int:
         traceback.print_exc(file=sys.stderr)
         return 1
 
-    emit("ready", engine=engine)
+    emit("ready", engine=engine, backend=recognizer.backend)
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -253,6 +296,7 @@ def serve(engine: str, cache_root: Path) -> int:
                 "result",
                 id=request_id,
                 engine=engine,
+                backend=recognizer.backend,
                 text=text,
                 language=language,
                 latency=latency,
@@ -273,7 +317,12 @@ def download(engine: str, cache_root: Path) -> int:
     configure_environment(cache_root)
     recognizer = Recognizer(engine, cache_root)
     recognizer.load()
-    emit("ready", engine=engine, message="Модель загружена и готова.")
+    emit(
+        "ready",
+        engine=engine,
+        backend=recognizer.backend,
+        message="Модель загружена и готова.",
+    )
     return 0
 
 

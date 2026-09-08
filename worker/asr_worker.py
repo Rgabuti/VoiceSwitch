@@ -49,65 +49,86 @@ def wav_duration(path: Path) -> float:
         return wav_file.getnframes() / float(wav_file.getframerate())
 
 
+def split_pcm(
+    samples: "np.ndarray",
+    rate: int,
+    *,
+    maximum_seconds: float = 22.0,
+    single_limit_seconds: float = 24.0,
+    minimum_seconds: float = 8.0,
+    search_seconds: float = 5.0,
+    window_seconds: float = 0.12,
+) -> list["np.ndarray"]:
+    """Режет запись на куски ≤ maximum_seconds по самому тихому окну.
+
+    Граница ищется в последних search_seconds перед жёстким пределом, но не
+    раньше minimum_seconds от начала куска. Запись короче single_limit_seconds
+    возвращается как есть — GigaAM принимает до 25 с.
+    """
+    import numpy as np
+
+    total = len(samples)
+    if total <= int(rate * single_limit_seconds):
+        return [samples]
+
+    maximum = int(rate * maximum_seconds)
+    minimum = int(rate * minimum_seconds)
+    search_span = int(rate * search_seconds)
+    window = max(1, int(rate * window_seconds))
+
+    boundaries = [0]
+    start = 0
+    while total - start > maximum:
+        hard_end = min(total, start + maximum)
+        search_start = max(start + minimum, hard_end - search_span)
+        best_end = hard_end
+        best_energy = float("inf")
+        for candidate in range(search_start, hard_end, window):
+            segment = samples[candidate : min(candidate + window, hard_end)]
+            if segment.size == 0:
+                continue
+            energy = float(np.mean(np.abs(segment)))
+            if energy < best_energy:
+                best_energy = energy
+                best_end = candidate + segment.size // 2
+        boundaries.append(best_end)
+        start = best_end
+    boundaries.append(total)
+    return [samples[left:right] for left, right in zip(boundaries, boundaries[1:])]
+
+
 def split_wav_for_gigaam(
     source: Path,
     *,
     maximum_seconds: float = 22.0,
 ) -> tuple[list[Path], tempfile.TemporaryDirectory[str] | None]:
     """Split on a low-energy region so every GigaAM chunk stays below 25 s."""
+    import numpy as np
+
     with wave.open(str(source), "rb") as wav_file:
         parameters = wav_file.getparams()
         frame_rate = wav_file.getframerate()
         channels = wav_file.getnchannels()
         sample_width = wav_file.getsampwidth()
-        frame_count = wav_file.getnframes()
-        frames = wav_file.readframes(frame_count)
-
-    if frame_count / float(frame_rate) <= 24.0:
-        return [source], None
+        frames = wav_file.readframes(wav_file.getnframes())
 
     if channels != 1 or sample_width != 2:
         raise ValueError("Ожидается mono PCM WAV 16-bit.")
 
-    import numpy as np
-
     samples = np.frombuffer(frames, dtype="<i2")
-    maximum = int(frame_rate * maximum_seconds)
-    minimum = int(frame_rate * 8.0)
-    search_span = int(frame_rate * 5.0)
-    analysis_window = max(1, int(frame_rate * 0.12))
-
-    boundaries = [0]
-    start = 0
-    total = len(samples)
-    while total - start > maximum:
-        hard_end = min(total, start + maximum)
-        search_start = max(start + minimum, hard_end - search_span)
-        best_end = hard_end
-        best_energy = float("inf")
-
-        for candidate in range(search_start, hard_end, analysis_window):
-            segment = samples[candidate : min(candidate + analysis_window, hard_end)]
-            if segment.size == 0:
-                continue
-            energy = float(np.mean(np.abs(segment.astype(np.float32))))
-            if energy < best_energy:
-                best_energy = energy
-                best_end = candidate + segment.size // 2
-
-        boundaries.append(best_end)
-        start = best_end
-    boundaries.append(total)
+    chunks = split_pcm(samples, frame_rate, maximum_seconds=maximum_seconds)
+    if len(chunks) == 1:
+        return [source], None
 
     temporary = tempfile.TemporaryDirectory(prefix="voiceswitch-gigaam-")
-    chunks: list[Path] = []
-    for index, (left, right) in enumerate(zip(boundaries, boundaries[1:])):
+    outputs: list[Path] = []
+    for index, chunk in enumerate(chunks):
         output = Path(temporary.name) / f"chunk-{index:03d}.wav"
         with wave.open(str(output), "wb") as wav_file:
             wav_file.setparams(parameters)
-            wav_file.writeframes(samples[left:right].astype("<i2").tobytes())
-        chunks.append(output)
-    return chunks, temporary
+            wav_file.writeframes(chunk.astype("<i2").tobytes())
+        outputs.append(output)
+    return outputs, temporary
 
 
 class Recognizer:

@@ -136,6 +136,14 @@ final class AppState: ObservableObject {
         }
         hotKey.start()
 
+        // Модель через transcribe.cpp грузится за доли секунды и занимает
+        // ~400 МБ, поэтому поднимаем воркер сразу, а не на первой записи дня.
+        if onboardingCompleted {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.prewarmSelectedEngine()
+            }
+        }
+
         asrService.onWorkerEvent = { [weak self] message in
             guard let self,
                   !self.isRecording,
